@@ -1,10 +1,3 @@
-/*
- * Prototipe sensor jembatan: MPU6500 + ESP32 (ESP-IDF, driver I2C legacy)
- * Alur: sampling periodik -> ring buffer (ada data PRA-trigger) -> trigger relatif baseline
- *       -> kumpulkan data pasca-trigger -> buang rata-rata -> taper akhir -> FFT -> 3 puncak
- *
- * Catatan: nilai register LPF mengikuti datasheet MPU-6500; verifikasi di datasheet Anda.
- */
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
@@ -17,41 +10,39 @@
 
 static const char *TAG = "SENSOR_JEMBATAN";
 
-/* ============ KONFIGURASI ============ */
-/* Pin I2C. GPIO22-25 TIDAK ADA di ESP32-S3, jadi S3 memakai pin lain. */
 #if CONFIG_IDF_TARGET_ESP32S3
   #define I2C_SDA_IO        8
   #define I2C_SCL_IO        9
 #else
-  #define I2C_SDA_IO        22      /* sesuai wiring asli: SCL=21, SDA=22 */
+  #define I2C_SDA_IO        22   
   #define I2C_SCL_IO        21
 #endif
 #define I2C_PORT            I2C_NUM_0
 #define I2C_FREQ_HZ         400000
 #define I2C_TIMEOUT         pdMS_TO_TICKS(50)
 
-#define MPU_ADDR            0x68    /* AD0 ke GND */
+#define MPU_ADDR            0x68   
 #define REG_SMPLRT_DIV      0x19
-#define REG_ACCEL_CONFIG    0x1C    /* full-scale range */
-#define REG_ACCEL_CONFIG2   0x1D    /* LPF hardware untuk ACCELEROMETER */
+#define REG_ACCEL_CONFIG    0x1C   
+#define REG_ACCEL_CONFIG2   0x1D    
 #define REG_ACCEL_XOUT_H    0x3B
 #define REG_PWR_MGMT_1      0x6B
 #define REG_WHO_AM_I        0x75
-#define ACCEL_LSB_PER_G     16384.0f   /* +-2 g */
+#define ACCEL_LSB_PER_G     16384.0f   
 
-#define FS_HZ               100        /* laju sampling nominal */
-#define SAMPLES             512        /* harus pangkat 2 */
-#define PRE_SAMPLES         64         /* data sebelum trigger yang ikut direkam */
-#define ACCEL_AXIS          2          /* 0=X, 1=Y, 2=Z */
-#define ACCEL_DLPF_CFG      3          /* 3 ~ 45 Hz, 4 ~ 21 Hz (anti-aliasing untuk fs=100 Hz) */
-#define TRIGGER_COUNTS      1600       /* ~0.1 g relatif terhadap baseline */
-#define HOLDOFF_SAMPLES     300        /* jeda setelah event (3 s) */
-#define WARMUP_SAMPLES      200        /* waktu baseline menetap (2 s) */
+#define FS_HZ               100        
+#define SAMPLES             512        
+#define PRE_SAMPLES         64       
+#define ACCEL_AXIS          2          
+#define ACCEL_DLPF_CFG      3          
+#define TRIGGER_COUNTS      1600     
+#define HOLDOFF_SAMPLES     300        
+#define WARMUP_SAMPLES      200       
 #define BAND_MIN_HZ         0.5f
 #define BAND_MAX_HZ         40.0f
-#define TAPER_FRAC          0.2f       /* porsi akhir jendela yang diturunkan halus ke 0 */
+#define TAPER_FRAC          0.2f       
 #define N_PEAKS             3
-#define FFT_SELFTEST        0          /* 1 = uji FFT dengan sinus 10 Hz buatan */
+#define FFT_SELFTEST        0        
 
 #if CONFIG_FREERTOS_HZ < 100
   #error "CONFIG_FREERTOS_HZ minimal 100 untuk sampling 100 Hz"
@@ -59,12 +50,10 @@ static const char *TAG = "SENSOR_JEMBATAN";
 
 #define TRY(x) do { esp_err_t _e = (x); if (_e != ESP_OK) return _e; } while (0)
 
-/* ============ BUFFER GLOBAL (static DRAM, bukan stack) ============ */
 static int16_t ring[SAMPLES];
 static float   vReal[SAMPLES], vImag[SAMPLES];
 static float   tw_cos[SAMPLES / 2], tw_sin[SAMPLES / 2];
 
-/* ============ I2C & MPU6500 ============ */
 static esp_err_t i2c_init(void)
 {
     i2c_config_t conf = {
@@ -98,13 +87,13 @@ static esp_err_t mpu_init(void)
     if (id != 0x70) {
         ESP_LOGW(TAG, "ID tidak 0x70: cek modul/klon dan wiring, lanjut dengan risiko sendiri");
     }
-    TRY(mpu_write(REG_PWR_MGMT_1, 0x80));          /* reset perangkat */
+    TRY(mpu_write(REG_PWR_MGMT_1, 0x80));          
     vTaskDelay(pdMS_TO_TICKS(100));
-    TRY(mpu_write(REG_PWR_MGMT_1, 0x01));          /* bangun, pilih clock terbaik */
+    TRY(mpu_write(REG_PWR_MGMT_1, 0x01));          
     vTaskDelay(pdMS_TO_TICKS(50));
-    TRY(mpu_write(REG_SMPLRT_DIV, 0x00));          /* output 1 kHz; kita polling 100 Hz */
-    TRY(mpu_write(REG_ACCEL_CONFIG, 0x00));        /* +-2 g */
-    TRY(mpu_write(REG_ACCEL_CONFIG2, ACCEL_DLPF_CFG & 0x07)); /* LPF accel */
+    TRY(mpu_write(REG_SMPLRT_DIV, 0x00));         
+    TRY(mpu_write(REG_ACCEL_CONFIG, 0x00));       
+    TRY(mpu_write(REG_ACCEL_CONFIG2, ACCEL_DLPF_CFG & 0x07));
     return ESP_OK;
 }
 
@@ -117,7 +106,7 @@ static bool read_accel(int16_t *out)
     return true;
 }
 
-/* ============ FFT radix-2 (tabel twiddle, float) ============ */
+
 static void fft_init(void)
 {
     for (int k = 0; k < SAMPLES / 2; k++) {
@@ -130,7 +119,7 @@ static void fft_init(void)
 static void fft(float *re, float *im, int n)
 {
     int j = 0;
-    for (int i = 0; i < n - 1; i++) {              /* bit-reversal */
+    for (int i = 0; i < n - 1; i++) {             
         if (i < j) {
             float t = re[i]; re[i] = re[j]; re[j] = t;
             t = im[i]; im[i] = im[j]; im[j] = t;
@@ -139,12 +128,12 @@ static void fft(float *re, float *im, int n)
         while (k <= j) { j -= k; k >>= 1; }
         j += k;
     }
-    for (int half = 1; half < n; half <<= 1) {     /* butterfly */
+    for (int half = 1; half < n; half <<= 1) {   
         int step = n / (half * 2);
         for (int base = 0; base < n; base += half * 2) {
             for (int k = 0; k < half; k++) {
                 float c = tw_cos[k * step];
-                float s = -tw_sin[k * step];       /* e^{-j...} */
+                float s = -tw_sin[k * step];    
                 int p = base + k, q = p + half;
                 float tr = c * re[q] - s * im[q];
                 float ti = s * re[q] + c * im[q];
@@ -155,10 +144,9 @@ static void fft(float *re, float *im, int n)
     }
 }
 
-/* ============ PEMROSESAN SATU EVENT ============ */
+
 typedef struct { float f; float m; } peak_t;
 
-/* head = indeks sampel TERTUA di ring (urutan kronologis dimulai dari sini) */
 static void process_event(int head, float fs_meas)
 {
     double sum = 0;
@@ -166,7 +154,7 @@ static void process_event(int head, float fs_meas)
         vReal[i] = (float)ring[(head + i) % SAMPLES] / ACCEL_LSB_PER_G;
         sum += vReal[i];
     }
-    float mean = (float)(sum / SAMPLES);           /* buang DC/gravitasi/offset */
+    float mean = (float)(sum / SAMPLES);         
 
     int taper_start = (int)((float)SAMPLES * (1.0f - TAPER_FRAC));
     float peak_g = 0.0f;
@@ -201,12 +189,12 @@ static void process_event(int head, float fs_meas)
     for (int k = kmin; k <= kmax; k++) {
         band_sum += mag[k];
         band_n++;
-        if (mag[k] > mag[k - 1] && mag[k] >= mag[k + 1]) {      /* maksimum lokal */
+        if (mag[k] > mag[k - 1] && mag[k] >= mag[k + 1]) {    
             float a = mag[k - 1], b = mag[k], c = mag[k + 1];
             float den = a - 2.0f * b + c;
-            float delta = (fabsf(den) > 1e-12f) ? 0.5f * (a - c) / den : 0.0f; /* interpolasi parabola */
+            float delta = (fabsf(den) > 1e-12f) ? 0.5f * (a - c) / den : 0.0f; 
             peak_t p = { ((float)k + delta) * df, b };
-            for (int i = 0; i < N_PEAKS; i++) {                 /* sisip terurut menurun */
+            for (int i = 0; i < N_PEAKS; i++) {                
                 if (p.m > pk[i].m) { peak_t t = pk[i]; pk[i] = p; p = t; }
             }
         }
@@ -223,7 +211,6 @@ static void process_event(int head, float fs_meas)
     ESP_LOGI(TAG, "========================================");
 }
 
-/* ============ TASK UTAMA ============ */
 static void sensor_task(void *arg)
 {
     ESP_ERROR_CHECK(i2c_init());
@@ -239,11 +226,11 @@ static void sensor_task(void *arg)
     const TickType_t period = pdMS_TO_TICKS(1000 / FS_HZ);
     TickType_t last_wake = xTaskGetTickCount();
 
-    int head = 0;                 /* indeks tulis berikutnya = sampel tertua */
+    int head = 0;                 
     float baseline = 0.0f;
     bool have_base = false;
     int warmup = WARMUP_SAMPLES, holdoff = 0;
-    int post_left = -1;           /* <0: IDLE; >=0: sedang mengumpulkan data pasca-trigger */
+    int post_left = -1;          
     int16_t last_good = 0;
     uint32_t n_total = 0, err_count = 0;
     int64_t t0 = esp_timer_get_time();
@@ -251,13 +238,13 @@ static void sensor_task(void *arg)
     ESP_LOGI(TAG, "Sistem siap. Menunggu pukulan aktuator...");
 
     for (;;) {
-        vTaskDelayUntil(&last_wake, period);       /* periode tetap, tanpa drift */
+        vTaskDelayUntil(&last_wake, period);     
 
         int16_t x;
         if (read_accel(&x)) {
             last_good = x;
         } else {
-            x = last_good;                         /* jaga garis waktu tetap utuh */
+            x = last_good;                         
             err_count++;
         }
         ring[head] = x;
@@ -265,30 +252,30 @@ static void sensor_task(void *arg)
         n_total++;
         if (!have_base) { baseline = (float)x; have_base = true; }
 
-        if (post_left < 0) {                       /* ---- IDLE ---- */
+        if (post_left < 0) {                       
             float dev = (float)x - baseline;
             if (warmup == 0 && holdoff == 0 && fabsf(dev) > TRIGGER_COUNTS) {
                 ESP_LOGW(TAG, "Trigger! Mengumpulkan %d sampel pasca-trigger...", SAMPLES - PRE_SAMPLES - 1);
                 post_left = SAMPLES - PRE_SAMPLES - 1;
             } else {
                 if (fabsf(dev) < TRIGGER_COUNTS) {
-                    baseline += ((warmup > 0) ? 0.05f : 0.005f) * dev;   /* baseline mengikuti perlahan */
+                    baseline += ((warmup > 0) ? 0.05f : 0.005f) * dev;  
                 }
                 if (warmup > 0) warmup--;
                 if (holdoff > 0) holdoff--;
             }
-        } else if (--post_left == 0) {             /* ---- selesai merekam ---- */
+        } else if (--post_left == 0) {            
             int64_t dt_us = esp_timer_get_time() - t0;
             float fs_meas = (dt_us > 0) ? (float)n_total * 1e6f / (float)dt_us : (float)FS_HZ;
             if (err_count) ESP_LOGW(TAG, "Ada %u kegagalan baca I2C pada periode ini", (unsigned)err_count);
 
-            process_event(head, fs_meas);          /* head = sampel tertua */
+            process_event(head, fs_meas);          
 
             post_left = -1;
             holdoff = HOLDOFF_SAMPLES;
             err_count = 0;
             n_total = 0;
-            last_wake = xTaskGetTickCount();       /* hindari 'kebut mengejar' setelah proses lama */
+            last_wake = xTaskGetTickCount();       
             t0 = esp_timer_get_time();
             ESP_LOGI(TAG, "Sistem siap. Menunggu pukulan aktuator...");
         }
